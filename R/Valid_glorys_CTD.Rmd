@@ -1,0 +1,433 @@
+---
+title: "Validation de glorys pour bouffe capelan"
+author: "Caroline Lehoux"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    code_folding: hide
+---
+
+```{r setup}
+#2 choses à faire attention
+##1) étant donné qu'un environnment Python est créer utiliser option ou R profile pour storer les password pourrait ne pas fonctionner
+##2) il ne semble pas y avoir d'option d'overwrite. Donc, si un changement doit être apporté n'oubliez pas de supprimer le fichier avanty d'en créer un nouveau
+
+##si output_filename et output_directory ne sont pas là, le fichier est enregistré dans le working directory avec un nom des limites de la requête.
+
+#basé sur :
+#https://help.marine.copernicus.eu/en/articles/8283072-copernicus-marine-toolbox-api-subset#h_ac2947af13
+#et
+#https://help.marine.copernicus.eu/en/articles/8638253-how-to-download-data-via-the-copernicus-marine-toolbox-in-r
+library(reticulate)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+#install_python()
+library(tidyverse)
+library(sf)
+library(stars)
+library(readr)
+
+ # passwords for Glorys
+
+new.glorys=F #prevent downloading if already there  
+
+```
+
+```{r positions}
+set<- read.csv("data/sets.csv")
+set.sf <- set %>%
+  mutate(date = ymd(date_deb),
+         month = sprintf("%02d", ifelse(is.na(month), month(date), month)),
+         date=coalesce(date, ymd(paste(year, month, day, sep="-")))) %>%
+  st_as_sf(coords = c("long", "lat"), crs=4326, remove=FALSE)
+```
+
+## Download
+
+```{r download}
+source("R/user.R")
+if(new.glorys){
+
+download.glorys_monthly = function (my.year){
+  
+  for(y in my.year){
+    for(m in c(8, 9)){
+    result <- cm$subset(
+      dataset_id = if_else(y <= 2020, "cmems_mod_glo_phy_my_0.083deg_P1M-m","cmems_mod_glo_phy_myint_0.083deg_P1M-m"),
+      start_datetime=paste0(y,"-0", m, "-01T00:00:00"),
+      end_datetime=paste0(y,"-0",m ,"-30T00:00:00"),
+      variables = list("thetao"),
+      minimum_longitude = floor(min(set$lon)),
+      maximum_longitude = ceiling(max(set$lon)),
+      minimum_latitude = floor(min(set$lat)),
+      maximum_latitude = ceiling(max(set$lat)),
+      minimum_depth=0,
+      maximum_depth=600,
+      output_filename = paste0("Glorys12V1_",y,"_0",m, ".nc"),
+      output_directory = "data/glorys/monthly", 
+      )
+    }
+  }
+}
+
+download.glorys_monthly(my.year=unique(set$year))
+}
+
+```
+
+## Extraire et comparer la température dans la chalut avec au fond dans Glorys
+
+
+```{r extract fond}
+library(stars)
+###calcul des indicateurs
+extract_glorys <- function(clim_dir = "data/glorys/monthly/", set) {
+  
+   # List all files
+  files <- list.files(clim_dir, full.names = TRUE)
+  files_df <- tibble(
+    file = files,
+    year= substring(files, 32, 35),
+    month=substring(files, 37, 38)
+  ) 
+  
+  # Iterate through the files efficiently
+  final <- files_df %>% 
+    mutate(res = pmap(
+      list(file, year, month),
+      function(f, y, m) {
+        points_sub <- filter(set.sf, year == y, month == m)
+        if (nrow(points_sub) == 0)
+          return(NULL)
+        
+        # Read the climate data 
+        sy <- read_ncdf(f) #
+        
+        # Extract needed values; assuming a function st_extract(sy, sf)
+        vals <- st_extract(sy, points_sub) %>% 
+          as_tibble() %>%
+          group_by(geometry, time) %>%
+          filter(!is.na(thetao)) %>%
+          slice_max(order_by=depth, n=1)
+        
+        # Join output back to points_sub as needed
+        left_join(
+          points_sub, vals,
+          by = c("geometry")
+        )
+      }
+    )) %>%
+    pull(res) %>%
+    compact() %>%
+    bind_rows()
+  
+  final
+}
+
+library(units)
+glorys.sf<- extract_glorys(clim_dir = "data/glorys/monthly/", set=set.sf) %>%  drop_units()
+
+glorys.sf %>%  ggplot(aes(x= thetao, y=Tmp_fond)) +
+  geom_point(aes(col=as.factor(region))) +
+  geom_abline(slope=1, intercept=0, col="black", lty=2)+
+  geom_hline(yintercept = 2, col="dodgerblue")+
+  geom_hline(yintercept=3, col="salmon")+
+geom_vline(xintercept = 2, col="dodgerblue")+
+  geom_vline(xintercept=3, col="salmon") +theme_bw() +
+  scale_color_manual(values=c("salmon", "dodgerblue"), name="") +
+  xlab("Glorys") +ylab("CTD")
+```
+
+## Download CTD complet des 2 relevés
+
+```{r download.ctd}
+if(!file.exists("data/CTD_data.RDS")){
+
+#un pont odbc doit d'abord être créé
+  conn = odbc::dbConnect(odbc::odbc(), "SGDOP", UID = username, 
+                         PWD = password, encoding="Latin1")
+
+  #requête sql pour la base de données
+   sql_ctd <-"SELECT
+mi.desc_miss,	
+mi.acr_miss,	
+mi.nom_nav_miss,	
+ctd.seq_jd,	
+ctd.latd, 	
+ctd.lond,	
+TO_CHAR(ctd.sytm, 'YYYY/MM/DD') as dat,	
+TO_CHAR(ctd.sytm, 'YYYY') as year,	
+to_char(ctd.sytm,'HH24:MI:SS')as Heure,	
+jd.fus_hor_jd,	
+ctd.deph,	
+ctd.te90 temperature,	
+ctd.psal salinity,	
+ctd.dens density	
+FROM SGDO.MISSION_EXP mi,SGDO.JEU_DONNEES jd, SGDO.DONNEES_CTD ctd	
+WHERE ctd.SEQ_JD = jd.seq_jd	
+AND mi.acr_miss = jd.acr_miss	
+AND (mi.desc_miss LIKE '%multi%'	
+      OR mi.desc_miss LIKE '%poiss%'	
+       OR lower(mi.desc_miss) LIKE '%ground%'	
+        OR lower(mi.desc_miss) LIKE '%south%'
+      OR mi.desc_miss LIKE '%crevette%'	
+      OR mi.desc_miss LIKE '%stock%'	
+      OR mi.desc_miss LIKE '%estival%')	
+    AND mi.desc_miss NOT LIKE '%mena%'	
+    AND mi.desc_miss NOT LIKE '%sud%'	
+    AND TO_CHAR(mi.dat_deb_miss, 'YYYY') >= 2018	
+    AND ( TO_CHAR(mi.dat_deb_miss, 'MM') = 7	
+          OR TO_CHAR(mi.dat_deb_miss, 'MM') = 8
+          OR TO_CHAR(mi.dat_deb_miss, 'MM') = 9)	
+    AND ( upper(mi.nom_nav_miss) LIKE '%NEEDLER%'	
+          OR upper(mi.nom_nav_miss) LIKE '%CABOT%'
+          OR upper(mi.nom_nav_miss) LIKE '%CARTIER%'
+          OR upper(mi.nom_nav_miss) LIKE '%TELEOST%'	
+          OR upper(mi.nom_nav_miss) LIKE '%CALANUS%' )	
+ORDER BY year"
+     
+     
+ ctd_results <- odbc::dbGetQuery(conn, sql_ctd)
+  ctd_results <-ctd_results %>%  rename_with(tolower)
+#get unique seq_jd for join
+  ctd_jd= ctd_results %>% mutate(dat=ymd(dat)) %>% 
+    dplyr::select(desc_miss, seq_jd, latd, lond, dat) %>%  
+    distinct() %>% 
+    st_as_sf(coords=c("lond", "latd"), crs=4326)
+
+  #sélectionner les ctd fait au plus 2 jour avant après le trait de chalut
+    library(fuzzyjoin)
+  JD_time <- difference_inner_join(
+    set.sf, ctd_jd,
+    by   = c("date" = "dat"),
+    max_dist = 2,  # 2 days
+    distance_col = "date_distance"
+  )
+  
+  #et au plus pour 10 km
+  JD_time <- JD_time %>%
+    mutate(geo_dist = st_distance(geometry.x, geometry.y, by_element = TRUE)) %>%
+    filter(as.numeric(geo_dist) <= 5000) # 5km
+  
+  # Keep only the nearest CTD for each set
+  JD <- JD_time %>%
+    group_by(row_id = row_number()) %>%
+    slice_min(geo_dist, n=1, with_ties=FALSE) %>%
+    ungroup()
+
+  
+
+ check<- left_join(JD,ctd_results %>%  
+           filter(seq_jd %in% JD$seq_jd) %>% 
+             mutate(year=as.numeric(year),
+                    dat=ymd(dat))) %>%  
+           group_by(desc_miss,acr_miss,nom_nav_miss,seq_jd,latd,lond,dat,year,heure) %>% 
+           filter( (region=="NGSL" & temperature <= 3 ) | (region=="SGSL" & temperature <=2)) %>% #selectionner les température
+          group_by(date,trait, year, region, prof_moy, lat, long, geometry.x) %>% 
+         summarize(mindepth=min(deph),
+                   maxdepth=max(deph),
+                   temp=mean(temperature))  %>%  mutate(output="CTD")%>% rename(geometry=geometry.x) %>% 
+   mutate(month=str_pad(month(date), width=2, pad="0", side="left")) %>%  
+   st_as_sf(crs=4326)
+
+write_rds(check, "data/CTD_data.RDS")
+
+} else check <-  readRDS("data/CTD_data.RDS")
+```
+
+## Extraire les profondeurs favorables dans Glorys
+
+```{r check.glorys}
+
+library(stars)
+ ###calcul des indicateurs
+ extract_glorys_depthj <- function(clim_dir = "data/glorys/monthly/", set) {
+   
+   # List all files
+   files <- list.files(clim_dir, full.names = TRUE)
+   files_df <- tibble(
+     file = files,
+     year= substring(files, 32, 35),
+     month=substring(files, 37, 38)
+   ) 
+   
+   # Iterate through the files efficiently
+   final <- files_df %>% 
+     mutate(res = pmap(
+       list(file, year, month),
+       function(f, y, m) {
+         points_sub <- filter(set, year == y, month == m)
+         if (nrow(points_sub) == 0)
+           return(NULL)
+         
+         # Read the climate data 
+         sy <- read_ncdf(f) #
+         library(units)
+         # Extract needed values; assuming a function st_extract(sy, sf)
+        
+          vals.df <- st_extract(sy, points_sub) %>% 
+           as_tibble() 
+          library(RcppRoll) 
+          depth.df <-   vals.df %>% group_by(geometry) %>%
+            mutate(
+            mind = roll_mean(depth, 2, fill = 0, align = "right"), 
+            maxd = roll_mean(depth, 2, fill = max(depth), align = "left"),
+            weight = maxd - mind) %>% st_drop_geometry() 
+          
+          depth.df<- left_join(points_sub %>%  as_tibble(), depth.df)
+          vals<- depth.df %>%
+           group_by(geometry, time) %>% drop_units() %>% 
+           filter(!is.na(thetao) & ((thetao <=3 & region=="NGSL")| (thetao <=2 & region=="SGSL")))%>%  
+           summarize(mindepth =min(depth),
+                     min.mindepth=min(mind),
+               maxdepth= max(depth), 
+               max.maxdepth=max(maxd),
+               temp=mean(thetao))
+         
+         # Join output back to points_sub as needed
+         left_join(
+           points_sub, vals,
+           by = c("geometry")
+         )
+       }
+     )) %>%
+     pull(res) %>%
+     compact() %>%
+     bind_rows()
+   
+   final
+ }
+ 
+ library(units)
+ gloryslim<- extract_glorys_depthj(clim_dir = "data/glorys/monthly/", 
+                                   set=check  %>% 
+                                   dplyr::select(-mindepth, -maxdepth ,-temp, -output) # will be generated for glorys
+                                   ) %>%  drop_units() %>%  mutate(output="glorys")
+```
+
+## Merge CTD - glorys
+
+```{r dat.merge}
+ all_depths<- bind_rows(check,gloryslim %>% mutate(maxdepth = max.maxdepth) )
+ 
+ compar_to_plot<- all_depths %>%  st_drop_geometry() %>% 
+   select(trait, year,region, mindepth, maxdepth, temp,prof_moy,  output)
+
+```
+
+## Comparaison CTD glorys
+
+```{r compar.prof}
+compar_to_plot %>%  mutate(Z= maxdepth-mindepth) %>%  
+   ggplot(aes(x=Z, fill=region))+ geom_histogram(position=position_dodge()) +
+   theme_bw() + scale_fill_manual(values=c("salmon", "dodgerblue"), name="") + 
+   xlab("Épaisseur de la couche de 'froide'") +ylab("N") +facet_wrap(~output)
+ 
+compar_to_plot %>%  mutate(Z= maxdepth-mindepth) %>%  
+   ggplot(aes(x=Z, fill=output))+ geom_histogram(position=position_dodge()) +
+   theme_bw() + scale_fill_manual(values=c("salmon", "dodgerblue"), name="") + 
+   xlab("Épaisseur de la couche de 'froide'") +ylab("N") +facet_wrap(~region)
+
+ 
+ compar_to_plot  %>% dplyr::select(-temp) %>% 
+   pivot_longer(4:5, values_to = "value", names_to = "var")  %>%  pivot_wider(names_from=output, values_from=value) %>% 
+   ggplot(aes(x=glorys, y=CTD)) +geom_point(aes(col=region)) +facet_wrap(~var, scales="free")+
+    geom_abline(slope=1, intercept=0, col="black", lty=2)+
+   theme_bw() +
+   scale_color_manual(values=c("salmon", "dodgerblue"), name="") +
+   xlab("Glorys") +ylab("CTD") 
+ 
+  library(ggpmisc)
+ my.formula <- y ~ x
+ compar_to_plot %>% ungroup()  %>%dplyr::select(trait, year, region,temp,output) %>% pivot_wider(names_from=output, values_from=temp) %>% 
+   ggplot(aes(x=glorys, y=CTD, col=region)) +geom_point() +
+   theme_bw() + ggtitle("Température moyenne dans la couche 'froide'")+
+   scale_color_manual(values=c("salmon", "dodgerblue"), name="")+ geom_abline(slope=1, intercept=0, col="black", lty=2)+
+   geom_smooth(method="lm", col="grey40")+
+  stat_poly_eq(formula = my.formula, 
+               aes(label = paste(..eq.label.., ..rr.label.., sep = "~~~")), 
+               parse = TRUE, vstep=0.08)
+ 
+ 
+ 
+out <-  compar_to_plot %>% ungroup()  %>%dplyr::select(trait, year, region,temp,output) %>% pivot_wider(names_from=output, values_from=temp)
+
+lm1<- lm(CTD ~ glorys, data=out)
+ 
+out$predglorys<-  predict(lm1, out, response=T)
+ 
+   ggplot(data=out,aes(x=predglorys, y=CTD, col=region)) +geom_point() +
+   theme_bw() + ggtitle("Température moyenne dans la couche 'froide'")+
+   scale_color_manual(values=c("salmon", "dodgerblue"), name="")+ geom_abline(slope=1, intercept=0, col="black", lty=2)
+
+```
+
+
+
+
+## Extraire les profondeurs favorables dans Glorys sur la grille
+
+```{r corrglorys}
+library(stars)
+clim_dir = "data/glorys/monthly/"
+out_dir="data/glorys/depths"
+   
+   # List all files
+   files <- list.files(clim_dir, full.names = TRUE)
+  
+for (f in files){
+          #Read the climate data 
+         sy <- read_ncdf(f) #
+         library(units)
+         # Extract needed values; assuming a function st_extract(sy, sf)
+        
+          vals.df <- sy %>% 
+           as_tibble() %>%  st_as_sf(coords=c("longitude" ,"latitude"), crs=4326, remove=F) %>%  drop_units()  %>%  rename(glorys=thetao)
+          vals.df$corrglorys = predict(lm1, vals.df)
+         
+          library(RcppRoll) 
+          depth.df <-   vals.df %>% group_by(geometry) %>%
+            mutate(
+            mind = roll_mean(depth, 2, fill = 0, align = "right"), 
+            maxd = roll_mean(depth, 2, fill = max(depth), align = "left"),
+            weight = maxd - mind) 
+          
+                  vals2<- depth.df %>%
+            group_by(latitude, longitude,geometry) %>% drop_units() %>%  filter(corrglorys <= 2) %>% 
+            summarize(mindepth2C=min(mind),
+                      maxdepth2C=max(maxd),
+                      ) %>% st_drop_geometry() %>% st_as_stars(dims=c("longitude", "latitude"))
+                  
+                  vals3<- depth.df %>%
+            group_by(latitude, longitude,geometry) %>% drop_units() %>%     filter(corrglorys <= 3) %>% 
+            summarize(mindepth3C=min(mind),
+                      maxdepth3C=max(maxd),
+                      ) %>% st_drop_geometry() %>% st_as_stars(dims=c("longitude", "latitude"))
+ 
+                  #when dims are different. equivalent to resample         
+st_crs(vals2) = 4326                  
+ st_crs(vals3) = 4326                  
+ vals2<- st_warp(vals2, vals3)
+                         
+ depth23<- c(vals2,vals3)
+# Construct new filename
+date_match <- regmatches(f, regexpr("\\d{4}_\\d{2}", f))
+new_fname <- paste0("Glorys12V1depths_", date_match, ".RDS")
+  # Rename file (use move/rename)
+write_rds( depth23, paste(out_dir, new_fname, sep="/"))
+log10p1_trans = function() scales::trans_new("log10p1", transform=function(x) log10(x+1), inverse=function(x) (10^x)-1)#inverse function is necessary for legend
+
+library(ggpubr)
+library(ggthemes)
+p1<- ggarrange(ggplot() + geom_stars(data=depth23[1]) +scale_fill_viridis_c(option="turbo", na.value = "transparent", limits=c(10,600),breaks=c(10,30,100,300), trans="log10p1")+theme_few(),
+          ggplot() + geom_stars(data=depth23[2])+scale_fill_viridis_c(option="turbo", na.value = "transparent", limits=c(10,600),breaks=c(10,30,100,300), trans="log10p1")+theme_few(),
+          ggplot() + geom_stars(data=depth23[3]) +scale_fill_viridis_c(option="turbo", na.value = "transparent", limits=c(10,600),breaks=c(10,30,100,300), trans="log10p1")+theme_few(),
+          ggplot() + geom_stars(data=depth23[4])+scale_fill_viridis_c(option="turbo", na.value = "transparent", limits=c(10,600),breaks=c(10,30,100,300), trans="log10p1")+theme_few(), ncol=2, nrow=2)
+p2<- annotate_figure(p1, date_match) 
+print(p2)
+}        
+    
+
+ 
+ 
+```

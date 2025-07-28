@@ -1,0 +1,107 @@
+---
+title: "Extraction de Calanus pour bouffe capelan"
+author: "Caroline Lehoux"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    code_folding: hide
+---
+
+```{r setup}
+#2 choses à faire attention
+##1) étant donné qu'un environnment Python est créer utiliser option ou R profile pour storer les password pourrait ne pas fonctionner
+##2) il ne semble pas y avoir d'option d'overwrite. Donc, si un changement doit être apporté n'oubliez pas de supprimer le fichier avanty d'en créer un nouveau
+
+##si output_filename et output_directory ne sont pas là, le fichier est enregistré dans le working directory avec un nom des limites de la requête.
+
+#basé sur :
+#https://help.marine.copernicus.eu/en/articles/8283072-copernicus-marine-toolbox-api-subset#h_ac2947af13
+#et
+#https://help.marine.copernicus.eu/en/articles/8638253-how-to-download-data-via-the-copernicus-marine-toolbox-in-r
+library(reticulate)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+#install_python()
+library(tidyverse)
+library(sf)
+library(stars)
+library(readr)
+library(scales)
+library(ggthemes)
+library(ggpubr)
+ # passwords for Glorys
+log10p1_trans = function() scales::trans_new("log10p1", transform=function(x) log10(x+1), inverse=function(x) (10^x)-1)#inverse function is necessary for legend
+
+
+```
+
+```{r positions}
+set<- read.csv("data/sets.csv")
+set.sf <- set %>%
+  mutate(date = ymd(date_deb),
+         month = sprintf("%02d", ifelse(is.na(month), month(date), month)),
+         date=coalesce(date, ymd(paste(year, month, day, sep="-")))) %>%
+  st_as_sf(coords = c("long", "lat"), crs=4326, remove=FALSE)
+```
+
+## load depths
+
+```{r load.depths}
+out_dir="data/glorys/depths"
+fdepths<- list.files(out_dir, full.names = T)[1:4] # temporarily removing 2024
+set.y=tibble()
+
+for ( f in  fdepths){
+date_match <- regmatches(f, regexpr("\\d{4}_\\d{2}", f))
+depths.stars<- readRDS(f)
+
+cal_dir = "C:/LEHOUX/Projects/Github/zoo_transbound/predictions/prediction_bioenergy/glorys/monthxlatxclimS050sqrt_clim_final"
+
+cal.sf<- readRDS(list.files(cal_dir, full.names=T, pattern=paste0("Bioenergy_", date_match, "_3D.RDS"))) %>%  st_as_sf(coords=c("X","Y"), crs=4326, remove=F)
+
+
+cal.extract<- bind_cols(cal.sf %>%  st_drop_geometry(), cal.sf %>% st_extract(x=depths.stars) %>%  as_tibble()) 
+test2<- cal.extract %>%  filter(!is.na(mindepth2C), Zlayer <= maxdepth2C, Zlayer >= mindepth2C) %>%  group_by(Label, fYear, month,bathymetry, X,Y) %>% 
+  summarise(Cfin_mg = sum (DW_Zlayer_mg_cfin),
+            Cgla_mg = sum (DW_Zlayer_mg_cgla),
+            Chyp_mg = sum (DW_Zlayer_mg_chyp),
+                 ) %>%  mutate(temp="2C", Cal_mg= Cfin_mg, Cgla_mg,Chyp_mg) %>%  st_as_stars(dims=c("X", "Y"), crs=4326)
+p1=ggplot()+geom_stars(data=test2, aes(fill=Cfin_mg)) +scale_fill_viridis_c(option="turbo", na.value = "transparent",  trans="log10p1", breaks=c(0,10,100,1000,5000))+theme_few()
+p2=ggplot()+geom_stars(data=test2, aes(fill=Cgla_mg))+scale_fill_viridis_c(option="turbo", na.value = "transparent",  trans="log10p1", breaks=c(0,10,100,1000,5000))+theme_few()
+p3=ggplot()+geom_stars(data=test2, aes(fill=Chyp_mg))+scale_fill_viridis_c(option="turbo", na.value = "transparent", trans="log10p1", breaks=c(0,10,100,1000,5000))+theme_few()
+p4=ggplot()+geom_stars(data=test2, aes(fill=Cal_mg))+scale_fill_viridis_c(option="turbo", na.value = "transparent", trans="log10p1", breaks=c(0,10,100,1000,5000))+theme_few()
+
+p5<- ggarrange(p1, p2, p3, p4,ncol=2, nrow=2)
+p6<- annotate_figure(p5, date_match) 
+print(p6)
+
+test3<- cal.extract %>%  filter(!is.na(mindepth3C), Zlayer <= maxdepth3C, Zlayer >= mindepth3C) %>%  group_by(Label, fYear, month,bathymetry, X,Y) %>% 
+  summarise(Cfin_mg = sum (DW_Zlayer_mg_cfin),
+            Cgla_mg = sum (DW_Zlayer_mg_cgla),
+            Chyp_mg = sum (DW_Zlayer_mg_chyp),
+                 ) %>%  mutate(temp="3C", Calmg= Cfin_mg, Cgla_mg,Chyp_mg) %>%  st_as_stars(dims=c("X", "Y"))
+
+st_crs(test2) <-  4326
+st_crs(test3) <-  4326
+
+set.NGSLd<- set.sf %>%  filter(region=="NGSL", paste(year, month, sep="_") == date_match) 
+set.NGSLd<-bind_cols(set.NGSLd %>%  st_drop_geometry(), st_extract(test3, set.NGSLd )%>%  st_drop_geometry() %>%  dplyr::select(-fYear, -month))
+
+set.SGSLd<- set.sf %>%  filter(region=="SGSL", paste(year, month, sep="_") == date_match) 
+set.SGSLd<-bind_cols(set.SGSLd%>%  st_drop_geometry(), st_extract(test2, set.SGSLd)%>%  st_drop_geometry() %>%  dplyr::select(-fYear, -month))
+
+set.y<- bind_rows(set.y, set.NGSLd, set.SGSLd)
+# Construct new filename
+new_fname2 <- paste0("data/Calanus/Calanus2C_", date_match, ".RDS")
+new_fname3 <- paste0("data/Calanus/Calanus3C_", date_match, ".RDS")
+
+write_rds(test2, new_fname2)
+write_rds(test3, new_fname3)
+
+}
+
+write.csv(set.y, "data/set.out.csv")
+
+```
+
+
