@@ -65,7 +65,7 @@ test2<- cal.extract %>%  filter(!is.na(mindepth2C), Zlayer <= maxdepth2C, Zlayer
   summarise(Cfin_mg = sum (DW_Zlayer_mg_cfin),
             Cgla_mg = sum (DW_Zlayer_mg_cgla),
             Chyp_mg = sum (DW_Zlayer_mg_chyp),
-                 ) %>%  mutate(temp="2C", Cal_mg= Cfin_mg, Cgla_mg,Chyp_mg) %>%  st_as_stars(dims=c("X", "Y"), crs=4326)
+                 ) %>%  mutate(temp="2C", Cal_mg= Cfin_mg+Cgla_mg+Chyp_mg) %>%  st_as_stars(dims=c("X", "Y"), crs=4326)
 p1=ggplot()+geom_stars(data=test2, aes(fill=Cfin_mg)) +scale_fill_viridis_c(option="turbo", na.value = "transparent",  trans="log10p1", breaks=c(0,10,100,1000,5000))+theme_few()
 p2=ggplot()+geom_stars(data=test2, aes(fill=Cgla_mg))+scale_fill_viridis_c(option="turbo", na.value = "transparent",  trans="log10p1", breaks=c(0,10,100,1000,5000))+theme_few()
 p3=ggplot()+geom_stars(data=test2, aes(fill=Chyp_mg))+scale_fill_viridis_c(option="turbo", na.value = "transparent", trans="log10p1", breaks=c(0,10,100,1000,5000))+theme_few()
@@ -79,7 +79,7 @@ test3<- cal.extract %>%  filter(!is.na(mindepth3C), Zlayer <= maxdepth3C, Zlayer
   summarise(Cfin_mg = sum (DW_Zlayer_mg_cfin),
             Cgla_mg = sum (DW_Zlayer_mg_cgla),
             Chyp_mg = sum (DW_Zlayer_mg_chyp),
-                 ) %>%  mutate(temp="3C", Calmg= Cfin_mg, Cgla_mg,Chyp_mg) %>%  st_as_stars(dims=c("X", "Y"))
+                 ) %>%  mutate(temp="3C", Cal_mg= Cfin_mg+Cgla_mg+Chyp_mg) %>%  st_as_stars(dims=c("X", "Y"))
 
 st_crs(test2) <-  4326
 st_crs(test3) <-  4326
